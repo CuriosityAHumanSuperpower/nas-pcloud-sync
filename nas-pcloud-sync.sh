@@ -15,6 +15,11 @@
 #   --no-cap               Ignore the monthly cap: warn instead of stopping
 #   --cap-gb N             Override the cap size in GB (default: 50)
 #   --reset-cycle          Force-reset the current cycle's usage counter to 0
+#   --wait-for-nas N       Retry up to N times (30s apart) waiting for the first
+#                          origin path to become reachable before giving up.
+#                          Useful when launched at Windows logon, before the
+#                          NAS network share has finished reconnecting.
+#                          Default: 0 (no wait, fail immediately if unreachable)
 #   -h, --help             Show this help
 #
 # Requires: rclone (configured with a "pcloud" remote), bash, awk, date, du-like
@@ -34,6 +39,7 @@ CAP_GB=50
 DRY_RUN=0
 NO_CAP=0
 FORCE_RESET=0
+WAIT_FOR_NAS=0
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
@@ -155,6 +161,8 @@ while [ $# -gt 0 ]; do
             CAP_GB="$2"; shift 2 ;;
         --reset-cycle)
             FORCE_RESET=1; shift ;;
+        --wait-for-nas)
+            WAIT_FOR_NAS="$2"; shift 2 ;;
         -h|--help)
             usage ;;
         *)
@@ -164,6 +172,40 @@ done
 
 [ -f "$CONFIG_FILE" ] || die "Config file not found: $CONFIG_FILE"
 command -v rclone >/dev/null 2>&1 || die "rclone not found in PATH. Install/configure rclone first."
+
+# ---------------------------------------------------------------------------
+# Optional: wait for the NAS to become reachable (useful at Windows logon,
+# where the network share may not have finished reconnecting yet).
+# Polls the first non-comment, non-blank origin path from the config.
+# ---------------------------------------------------------------------------
+if [ "$WAIT_FOR_NAS" -gt 0 ]; then
+    FIRST_ORIGIN=""
+    while IFS='|' read -r o _d || [ -n "${o:-}" ]; do
+        [ -z "$(printf '%s' "$o" | tr -d ' \t')" ] && continue
+        case "$o" in \#*) continue ;; esac
+        FIRST_ORIGIN="$(echo "$o" | sed 's/^ *//;s/ *$//')"
+        break
+    done < "$CONFIG_FILE"
+
+    if [ -n "$FIRST_ORIGIN" ]; then
+        ATTEMPT=0
+        # Use rclone itself to test reachability rather than bash's [ -d ] test:
+        # native -d checks on UNC paths (\\host\share or //host/share) are
+        # unreliable under Git Bash/MSYS, whereas rclone's local backend
+        # already proved it can read these paths correctly.
+        until rclone lsf "$FIRST_ORIGIN" >/dev/null 2>&1; do
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ "$ATTEMPT" -gt "$WAIT_FOR_NAS" ]; then
+                log "NAS still unreachable after ${WAIT_FOR_NAS} attempts (path: $FIRST_ORIGIN). Giving up for this run."
+                summary "Run ${RUN_TS}: ABORTED - NAS unreachable after ${WAIT_FOR_NAS} attempts."
+                exit 1
+            fi
+            log "Waiting for NAS to become reachable (attempt ${ATTEMPT}/${WAIT_FOR_NAS}): $FIRST_ORIGIN"
+            sleep 30
+        done
+        log "NAS is reachable: $FIRST_ORIGIN"
+    fi
+fi
 
 CAP_BYTES="$(human_to_bytes_gb "$CAP_GB")"
 
@@ -201,8 +243,8 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
 
     PAIR_COUNT=$((PAIR_COUNT + 1))
 
-    if [ ! -d "$origin" ]; then
-        log "WARNING: origin path does not exist, skipping: $origin"
+    if ! rclone lsf "$origin" >/dev/null 2>&1; then
+        log "WARNING: origin path not reachable via rclone, skipping: $origin"
         continue
     fi
 
