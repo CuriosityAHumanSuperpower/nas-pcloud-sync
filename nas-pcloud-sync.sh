@@ -20,10 +20,32 @@
 #                          Useful when launched at Windows logon, before the
 #                          NAS network share has finished reconnecting.
 #                          Default: 0 (no wait, fail immediately if unreachable)
+#   --exclude "a,b,c"      Comma-separated list of glob patterns to exclude from
+#                          every pair's transfer (e.g. "Thumbs.db,desktop.ini,*.tmp").
+#                          Default: "Thumbs.db,desktop.ini,.DS_Store,*.tmp"
+#   --checksum             Compare files by checksum instead of size+modtime.
+#                          Catches corruption that preserves size/timestamp, at
+#                          the cost of reading every file fully on both sides
+#                          (slower, especially over a home network/NAS link).
+#                          Off by default.
 #   -h, --help             Show this help
 #
 # Requires: rclone (configured with a "pcloud" remote), bash, awk, date, du-like
 #           size parsing via rclone's own JSON stats (no extra deps needed).
+#
+# Resilience notes:
+#   - Transient network errors (NAS or pCloud) are retried automatically by
+#     rclone itself (--retries 5, --low-level-retries 10) before being treated
+#     as a real failure.
+#   - Progress toward the monthly cap is checkpointed to disk roughly every
+#     60 seconds WHILE a pair is transferring, not just after it completes.
+#     If the script/PC crashes mid-transfer, at most ~60s of cap accounting
+#     is lost - not the whole pair, regardless of how long it runs.
+#   - rclone copy never deletes; re-running after a crash is always safe and
+#     will only re-transfer what's missing or changed at the destination.
+#   - A lock file (state/run.lock) prevents two instances from running at the
+#     same time (e.g. a manual run overlapping a scheduled one), which could
+#     otherwise corrupt the cap accounting via concurrent writes.
 
 set -euo pipefail
 
@@ -35,11 +57,14 @@ CONFIG_FILE="${SCRIPT_DIR}/folders.conf"
 STATE_DIR="${SCRIPT_DIR}/state"
 LOG_DIR="${SCRIPT_DIR}/logs"
 STATE_FILE="${STATE_DIR}/usage_state.tsv"   # cycle_start_date<TAB>bytes_transferred
+LOCK_FILE="${STATE_DIR}/run.lock"
 CAP_GB=50
 DRY_RUN=0
 NO_CAP=0
 FORCE_RESET=0
 WAIT_FOR_NAS=0
+EXCLUDE_PATTERNS="Thumbs.db,desktop.ini,.DS_Store,*.tmp"
+USE_CHECKSUM=0
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
@@ -80,6 +105,44 @@ human_to_bytes_gb() {
 bytes_to_human() {
     # $1 = bytes -> human readable GB string
     awk -v b="$1" 'BEGIN { printf "%.2f GB", b / 1024 / 1024 / 1024 }'
+}
+
+# ---------------------------------------------------------------------------
+# Lock file: prevents two instances running at once (e.g. a manual run
+# overlapping a scheduled one), which could corrupt the cap accounting via
+# concurrent reads/writes to the state file. Implemented as a portable
+# PID-checked lock rather than flock, since flock isn't available on Git
+# Bash/MSYS (Windows) without extra installation.
+# ---------------------------------------------------------------------------
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local existing_pid
+        existing_pid="$(cat "$LOCK_FILE" 2>/dev/null || echo "")"
+        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+            die "Another instance is already running (PID ${existing_pid}, lock: $LOCK_FILE). Exiting to avoid corrupting the cap accounting."
+        else
+            log "Found a stale lock file (process ${existing_pid:-unknown} is not running). Removing it and continuing."
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    # Write atomically: create in a temp file on the same filesystem, then
+    # rename, so a crash mid-write can't leave a half-written lock file.
+    local tmp_lock
+    tmp_lock="$(mktemp "${STATE_DIR}/.run.lock.XXXXXX")"
+    echo "$$" > "$tmp_lock"
+    mv "$tmp_lock" "$LOCK_FILE"
+}
+
+release_lock() {
+    # Only remove the lock if it's still ours - avoids a race where this
+    # process's lock was already cleared/reclaimed by something else.
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid="$(cat "$LOCK_FILE" 2>/dev/null || echo "")"
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -163,6 +226,10 @@ while [ $# -gt 0 ]; do
             FORCE_RESET=1; shift ;;
         --wait-for-nas)
             WAIT_FOR_NAS="$2"; shift 2 ;;
+        --exclude)
+            EXCLUDE_PATTERNS="$2"; shift 2 ;;
+        --checksum)
+            USE_CHECKSUM=1; shift ;;
         -h|--help)
             usage ;;
         *)
@@ -170,8 +237,28 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ---------------------------------------------------------------------------
+# Input validation: fail with a clear message rather than a cryptic awk/
+# arithmetic error later if these were typo'd or passed garbage.
+# ---------------------------------------------------------------------------
+case "$CAP_GB" in
+    ''|*[!0-9.]*) die "--cap-gb must be a positive number, got: '$CAP_GB'" ;;
+esac
+case "$WAIT_FOR_NAS" in
+    ''|*[!0-9]*) die "--wait-for-nas must be a non-negative integer, got: '$WAIT_FOR_NAS'" ;;
+esac
+
 [ -f "$CONFIG_FILE" ] || die "Config file not found: $CONFIG_FILE"
 command -v rclone >/dev/null 2>&1 || die "rclone not found in PATH. Install/configure rclone first."
+
+# ---------------------------------------------------------------------------
+# Acquire the run lock before touching any state, and make sure it's always
+# released on exit - normal completion, an error (die/set -e), or a signal
+# like Ctrl+C - so a killed run doesn't permanently block future runs.
+# ---------------------------------------------------------------------------
+acquire_lock
+trap release_lock EXIT INT TERM
+
 
 # ---------------------------------------------------------------------------
 # Optional: wait for the NAS to become reachable (useful at Windows logon,
@@ -213,6 +300,7 @@ log "=== NAS -> pCloud sync started ==="
 log "Config file:   $CONFIG_FILE"
 log "Dry run:       $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 log "Cap:           ${CAP_GB} GB ($([ "$NO_CAP" -eq 1 ] && echo "warn-only, override active" || echo "hard stop when reached"))"
+log "Checksum mode: $([ "$USE_CHECKSUM" -eq 1 ] && echo "yes (slower, verifies file content)" || echo "no (size+modtime comparison)")"
 
 load_state
 log "Cycle:         $(current_cycle_start) -> next reset on 16th of following month"
@@ -223,6 +311,21 @@ if [ "$NO_CAP" -eq 0 ] && [ "$CURRENT_BYTES" -ge "$CAP_BYTES" ]; then
     summary "Run ${RUN_TS}: SKIPPED - cap already reached ($(bytes_to_human "$CURRENT_BYTES")/${CAP_GB}GB)."
     exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# Build the exclude flag list once. rclone's --exclude does NOT split on
+# commas within a single flag value (that would try to match a literal
+# filename containing a comma) - it needs one --exclude per pattern.
+# ---------------------------------------------------------------------------
+EXCLUDE_ARGS=()
+if [ -n "$EXCLUDE_PATTERNS" ]; then
+    IFS=',' read -ra _EXCLUDE_LIST <<< "$EXCLUDE_PATTERNS"
+    for pattern in "${_EXCLUDE_LIST[@]}"; do
+        pattern="$(echo "$pattern" | sed 's/^ *//;s/ *$//')"
+        [ -n "$pattern" ] && EXCLUDE_ARGS+=(--exclude "$pattern")
+    done
+fi
+log "Exclude patterns: ${EXCLUDE_PATTERNS:-none}"
 
 # ---------------------------------------------------------------------------
 # Read folder pairs and process each
@@ -258,13 +361,30 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
         break
     fi
 
-    # Plain human-readable log goes to the run log file.
+    # Plain human-readable log goes to the run log file. --use-json-log makes
+    # THAT file's entries JSON (for precise byte-count parsing below) - it does
+    # NOT affect the console, since --log-file redirects rclone's logger only.
+    # --progress renders its live bar straight to the terminal independently,
+    # so the two don't conflict even though --progress + --use-json-log can't
+    # be combined on the SAME stream.
+    PAIR_STATS_LOG="$(mktemp)"
     RCLONE_ARGS=(copy "$origin" "$destination"
-        --log-file="$RUN_LOG" --log-level INFO
-        --create-empty-src-dirs)
+        --progress
+        --log-file="$PAIR_STATS_LOG" --log-level INFO --use-json-log
+        --stats 2s --stats-one-line
+        --create-empty-src-dirs
+        --retries 5 --low-level-retries 10
+        "${EXCLUDE_ARGS[@]}")
 
     if [ "$DRY_RUN" -eq 1 ]; then
         RCLONE_ARGS+=(--dry-run)
+    fi
+
+    if [ "$USE_CHECKSUM" -eq 1 ]; then
+        # Compare by checksum instead of size+modtime - catches corruption
+        # that happens to preserve both, at the cost of reading every file
+        # fully on both sides (slower over a home NAS/network link).
+        RCLONE_ARGS+=(--checksum)
     fi
 
     if [ "$NO_CAP" -eq 0 ]; then
@@ -275,16 +395,46 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
         RCLONE_ARGS+=(--max-transfer="${REMAINING_BYTES}B" --cutoff-mode soft)
     fi
 
-    # Separately, capture a final JSON stats snapshot to get an exact byte count
-    # for this pair. rclone's --use-json-log emits one JSON object per log line,
-    # and periodic stats lines include a "stats" object with a precise "bytes"
-    # field. We parse the last such value rather than regexing human units,
-    # since human formatting (KiB/MiB/GiB, locale) is not reliable to parse.
-    PAIR_STATS_LOG="$(mktemp)"
+    # Run rclone in the BACKGROUND so this script can poll its progress and
+    # persist a running total periodically (every ~60s). This means a crash
+    # or power loss mid-transfer loses at most ~60s of accounting accuracy,
+    # instead of the entire pair's progress (which is what happens if state
+    # is only saved after the whole pair/run completes). --progress still
+    # writes live to the terminal as normal since the background process
+    # inherits this shell's stdout/stderr.
     set +e
-    rclone "${RCLONE_ARGS[@]}" \
-        --stats 1s --stats-one-line --use-json-log \
-        2>"$PAIR_STATS_LOG"
+    rclone "${RCLONE_ARGS[@]}" &
+    RCLONE_PID=$!
+
+    LAST_SAVED_PAIR_BYTES=0
+    LAST_CHECKPOINT_EPOCH=$(date +%s)
+    # Poll frequently (so fast/small pairs don't pay a needless wait before
+    # the loop notices rclone already finished), but only WRITE a checkpoint
+    # to disk at most once every ~60s, to keep disk I/O and log noise low.
+    while kill -0 "$RCLONE_PID" 2>/dev/null; do
+        sleep 2
+        NOW_EPOCH=$(date +%s)
+        if [ $((NOW_EPOCH - LAST_CHECKPOINT_EPOCH)) -lt 60 ]; then
+            continue
+        fi
+        LAST_CHECKPOINT_EPOCH="$NOW_EPOCH"
+        # rclone may not have flushed a stats line yet on the very first tick;
+        # that's fine, we just keep the last known value in that case.
+        POLL_BYTES="$(grep -o '"bytes":[0-9]*' "$PAIR_STATS_LOG" 2>/dev/null | tail -1 | grep -o '[0-9]*' || true)"
+        if [ -n "$POLL_BYTES" ] && [ "$POLL_BYTES" -gt "$LAST_SAVED_PAIR_BYTES" ]; then
+            LAST_SAVED_PAIR_BYTES="$POLL_BYTES"
+            if [ "$DRY_RUN" -eq 0 ]; then
+                PERSISTED_BYTES=$((CURRENT_BYTES + TOTAL_RUN_BYTES + LAST_SAVED_PAIR_BYTES))
+                ORIGINAL_CURRENT_BYTES="$CURRENT_BYTES"
+                CURRENT_BYTES="$PERSISTED_BYTES"
+                save_state
+                CURRENT_BYTES="$ORIGINAL_CURRENT_BYTES"
+                log "Checkpoint: $(bytes_to_human "$LAST_SAVED_PAIR_BYTES") into this pair, $(bytes_to_human "$PERSISTED_BYTES")/${CAP_GB}GB saved to disk in case of crash."
+            fi
+        fi
+    done
+
+    wait "$RCLONE_PID"
     RC_EXIT=$?
     set -e
 
