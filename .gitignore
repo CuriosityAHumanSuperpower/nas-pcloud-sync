@@ -1,4 +1,4 @@
 /folders.conf
 /logs*
 /state*
-.code-workspace
+*.code-workspace
