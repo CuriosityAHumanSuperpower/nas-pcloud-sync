@@ -46,6 +46,11 @@
 #   - A lock file (state/run.lock) prevents two instances from running at the
 #     same time (e.g. a manual run overlapping a scheduled one), which could
 #     otherwise corrupt the cap accounting via concurrent writes.
+#   - Multi-thread uploads are disabled (--multi-thread-streams 0). pCloud's
+#     chunked upload path returns "Access denied (2003)" on files above the
+#     256MiB multi-thread cutoff with some rclone versions (seen on v1.69.1;
+#     reportedly fixed in v1.71.0+). Disabling it trades some upload speed on
+#     very large files for reliability across rclone versions.
 
 set -euo pipefail
 
@@ -374,6 +379,7 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
         --stats 2s --stats-one-line
         --create-empty-src-dirs
         --retries 5 --low-level-retries 10
+        --multi-thread-streams 0
         "${EXCLUDE_ARGS[@]}")
 
     if [ "$DRY_RUN" -eq 1 ]; then
