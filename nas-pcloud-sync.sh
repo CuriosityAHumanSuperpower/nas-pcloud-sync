@@ -367,16 +367,20 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
     fi
 
     # Plain human-readable log goes to the run log file. --use-json-log makes
-    # THAT file's entries JSON (for precise byte-count parsing below) - it does
-    # NOT affect the console, since --log-file redirects rclone's logger only.
-    # --progress renders its live bar straight to the terminal independently,
-    # so the two don't conflict even though --progress + --use-json-log can't
-    # be combined on the SAME stream.
+    # THAT file's entries JSON (for precise byte-count parsing below).
+    #
+    # NOTE: --progress and periodic --stats-to-file are NOT independent in
+    # rclone - per rclone's own maintainer, progress and stats printing share
+    # the same internal mechanism, so enabling --progress effectively starves
+    # the periodic JSON stats lines this script needs for checkpointing (the
+    # log file stays empty/stale until the transfer finishes). So instead of
+    # --progress, the script prints its OWN periodic console line below,
+    # built from the same JSON stats used for checkpointing - giving live
+    # visibility without the conflict.
     PAIR_STATS_LOG="$(mktemp)"
     RCLONE_ARGS=(copy "$origin" "$destination"
-        --progress
         --log-file="$PAIR_STATS_LOG" --log-level INFO --use-json-log
-        --stats 2s --stats-one-line
+        --stats 15s --stats-one-line
         --create-empty-src-dirs
         --retries 5 --low-level-retries 10
         --multi-thread-streams 0
@@ -404,29 +408,28 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
     # Run rclone in the BACKGROUND so this script can poll its progress and
     # persist a running total periodically (every ~60s). This means a crash
     # or power loss mid-transfer loses at most ~60s of accounting accuracy,
-    # instead of the entire pair's progress (which is what happens if state
-    # is only saved after the whole pair/run completes). --progress still
-    # writes live to the terminal as normal since the background process
-    # inherits this shell's stdout/stderr.
+    # instead of the entire pair's progress. The script also prints its own
+    # live console line every poll tick (every 2s) instead of using rclone's
+    # --progress, since that flag silently starves the JSON stats this
+    # checkpointing relies on (see note above).
     set +e
     rclone "${RCLONE_ARGS[@]}" &
     RCLONE_PID=$!
 
     LAST_SAVED_PAIR_BYTES=0
     LAST_CHECKPOINT_EPOCH=$(date +%s)
-    # Poll frequently (so fast/small pairs don't pay a needless wait before
-    # the loop notices rclone already finished), but only WRITE a checkpoint
-    # to disk at most once every ~60s, to keep disk I/O and log noise low.
     while kill -0 "$RCLONE_PID" 2>/dev/null; do
         sleep 2
+        POLL_BYTES="$(grep -o '"bytes":[0-9]*' "$PAIR_STATS_LOG" 2>/dev/null | tail -1 | grep -o '[0-9]*' || true)"
+        if [ -n "$POLL_BYTES" ]; then
+            printf '\r  ...%s transferred so far' "$(bytes_to_human "$POLL_BYTES")" >&2
+        fi
+
         NOW_EPOCH=$(date +%s)
         if [ $((NOW_EPOCH - LAST_CHECKPOINT_EPOCH)) -lt 60 ]; then
             continue
         fi
         LAST_CHECKPOINT_EPOCH="$NOW_EPOCH"
-        # rclone may not have flushed a stats line yet on the very first tick;
-        # that's fine, we just keep the last known value in that case.
-        POLL_BYTES="$(grep -o '"bytes":[0-9]*' "$PAIR_STATS_LOG" 2>/dev/null | tail -1 | grep -o '[0-9]*' || true)"
         if [ -n "$POLL_BYTES" ] && [ "$POLL_BYTES" -gt "$LAST_SAVED_PAIR_BYTES" ]; then
             LAST_SAVED_PAIR_BYTES="$POLL_BYTES"
             if [ "$DRY_RUN" -eq 0 ]; then
@@ -435,10 +438,12 @@ while IFS='|' read -r origin destination || [ -n "${origin:-}" ]; do
                 CURRENT_BYTES="$PERSISTED_BYTES"
                 save_state
                 CURRENT_BYTES="$ORIGINAL_CURRENT_BYTES"
+                printf '\n' >&2
                 log "Checkpoint: $(bytes_to_human "$LAST_SAVED_PAIR_BYTES") into this pair, $(bytes_to_human "$PERSISTED_BYTES")/${CAP_GB}GB saved to disk in case of crash."
             fi
         fi
     done
+    printf '\n' >&2
 
     wait "$RCLONE_PID"
     RC_EXIT=$?
